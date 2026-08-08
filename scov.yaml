@@ -1,0 +1,13 @@
+name: scov
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pytorch>=2.2
+  - pytorch-cuda=12.1
+  - numpy>=1.24
+  - pandas>=2.0
+  - numba>=0.58
+  - tqdm>=4.66
