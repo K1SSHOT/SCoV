@@ -8,8 +8,7 @@ import torch
 from tqdm import tqdm
 
 from dataset import VirusDataset, build_train_loader
-from losses import SCoVLoss
-from model import SCoV
+from model import HexaCrossLoss, SCoV
 from utils import build_scheduler, mask_nucleotides, set_seed
 
 
@@ -17,13 +16,16 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Train SCoV on fixed-length viral fragments."
     )
+
     parser.add_argument("--train-csv", required=True, type=Path)
+
     parser.add_argument(
         "--fragment-length",
         required=True,
         type=int,
         choices=(300, 500),
     )
+
     parser.add_argument(
         "--output-dir",
         type=Path,
@@ -31,7 +33,6 @@ def parse_args():
     )
 
     parser.add_argument("--hidden-dim", type=int, default=128)
-    parser.add_argument("--num-heads", type=int, default=4)
     parser.add_argument("--dropout", type=float, default=0.2)
 
     parser.add_argument("--batch-size", type=int, default=512)
@@ -43,13 +44,16 @@ def parse_args():
     parser.add_argument("--grad-clip", type=float, default=1.0)
 
     parser.add_argument("--mask-probability", type=float, default=0.05)
+
     parser.add_argument(
         "--reverse-complement-probability",
         type=float,
         default=0.5,
     )
+
     parser.add_argument("--label-smoothing", type=float, default=0.1)
     parser.add_argument("--contrastive-weight", type=float, default=0.1)
+
     parser.add_argument(
         "--contrastive-temperature",
         type=float,
@@ -60,29 +64,37 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--save-every", type=int, default=1)
     parser.add_argument("--resume", type=Path, default=None)
+
     parser.add_argument(
         "--cache-dir",
         type=Path,
         default=Path(".cache"),
     )
+
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--non-deterministic", action="store_true")
 
     return parser.parse_args()
 
 
+def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
+    return getattr(model, "_orig_mod", model)
+
+
 def save_checkpoint(
-    path,
-    epoch,
-    model,
-    optimizer,
+    path: Path,
+    epoch: int,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
     scheduler,
-    scaler,
+    scaler: torch.amp.GradScaler,
 ):
+    raw_model = unwrap_model(model)
+
     torch.save(
         {
             "epoch": epoch,
-            "model_state_dict": model.state_dict(),
+            "model_state_dict": raw_model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
             "scaler_state_dict": scaler.state_dict(),
@@ -104,6 +116,11 @@ def main():
             f"Training CSV not found: {args.train_csv}"
         )
 
+    if args.resume is not None and not args.resume.exists():
+        raise FileNotFoundError(
+            f"Checkpoint not found: {args.resume}"
+        )
+
     args.output_dir.mkdir(
         parents=True,
         exist_ok=True,
@@ -123,25 +140,20 @@ def main():
         dataset=dataset,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
-        reverse_complement_probability=(
-            args.reverse_complement_probability
-        ),
+        reverse_complement_probability=args.reverse_complement_probability,
     )
 
     model = SCoV(
         d_model=args.hidden_dim,
-        num_heads=args.num_heads,
         dropout=args.dropout,
     ).to(device)
 
-    if args.compile and hasattr(torch, "compile"):
-        model = torch.compile(model)
-
-    criterion = SCoVLoss(
-        label_smoothing=args.label_smoothing,
-        contrastive_weight=args.contrastive_weight,
+    criterion = HexaCrossLoss(
+        cls_weight=1.0,
+        contra_weight=args.contrastive_weight,
+        smoothing=args.label_smoothing,
         temperature=args.contrastive_temperature,
-    )
+    ).to(device)
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -157,6 +169,7 @@ def main():
     )
 
     amp_enabled = device.type == "cuda"
+
     scaler = torch.amp.GradScaler(
         "cuda",
         enabled=amp_enabled,
@@ -170,25 +183,33 @@ def main():
             map_location="cpu",
             weights_only=False,
         )
+
         model.load_state_dict(
             checkpoint["model_state_dict"]
         )
+
         optimizer.load_state_dict(
             checkpoint["optimizer_state_dict"]
         )
+
         scheduler.load_state_dict(
             checkpoint["scheduler_state_dict"]
         )
+
         scaler.load_state_dict(
             checkpoint["scaler_state_dict"]
         )
+
         start_epoch = int(
             checkpoint.get("epoch", 0)
         )
 
+    if args.compile and hasattr(torch, "compile"):
+        model = torch.compile(model)
+
     parameter_count = sum(
         parameter.numel()
-        for parameter in model.parameters()
+        for parameter in unwrap_model(model).parameters()
         if parameter.requires_grad
     )
 
@@ -201,6 +222,7 @@ def main():
 
     for epoch_index in range(start_epoch, args.epochs):
         epoch = epoch_index + 1
+
         model.train()
 
         loss_sum = 0.0
@@ -220,26 +242,32 @@ def main():
             codon_mask,
             labels,
         ) in progress:
+
             nucleotide_one_hot = nucleotide_one_hot.to(
                 device,
                 non_blocking=True,
             )
+
             nucleotide_one_hot = mask_nucleotides(
                 nucleotide_one_hot,
                 args.mask_probability,
             )
+
             codon_ids = codon_ids.to(
                 device,
                 non_blocking=True,
             )
+
             nucleotide_mask = nucleotide_mask.to(
                 device,
                 non_blocking=True,
             )
+
             codon_mask = codon_mask.to(
                 device,
                 non_blocking=True,
             )
+
             labels = labels.to(
                 device,
                 non_blocking=True,
@@ -248,7 +276,7 @@ def main():
             optimizer.zero_grad(set_to_none=True)
 
             with torch.amp.autocast(
-                device_type="cuda",
+                device_type=device.type,
                 enabled=amp_enabled,
             ):
                 logits, fused_features, codon_features = model(
@@ -257,6 +285,7 @@ def main():
                     nucleotide_mask,
                     codon_mask,
                 )
+
                 loss = criterion(
                     logits,
                     labels,
@@ -265,9 +294,13 @@ def main():
                 )
 
             if not torch.isfinite(loss):
+                progress.set_postfix(
+                    loss="non-finite/skip"
+                )
                 continue
 
             scaler.scale(loss).backward()
+
             scaler.unscale_(optimizer)
 
             grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -279,6 +312,7 @@ def main():
             scaler.update()
 
             loss_value = float(loss.detach())
+
             loss_sum += loss_value
             grad_sum += float(grad_norm)
             step_count += 1
@@ -300,17 +334,21 @@ def main():
         }
 
         write_header = not log_path.exists()
+
         with log_path.open(
             "a",
             newline="",
             encoding="utf-8",
         ) as handle:
+
             writer = csv.DictWriter(
                 handle,
                 fieldnames=row.keys(),
             )
+
             if write_header:
                 writer.writeheader()
+
             writer.writerow(row)
 
         if (
