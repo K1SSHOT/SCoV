@@ -1,0 +1,6 @@
+# Verified on Python 3.12, Linux, CPU. Install a matching GPU PyTorch wheel separately.
+torch==2.5.1
+numpy==2.3.5
+pandas==2.2.3
+scikit-learn==1.8.0
+tqdm==4.67.1
